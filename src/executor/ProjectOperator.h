@@ -36,6 +36,9 @@ public:
     // 获取输出列类型
     std::vector<DataType> getColumnTypes() const override;
 
+    // 获取表名 (委托给子算子)
+    std::string getTableName() const override;
+
 private:
     OperatorPtr child_;
     std::vector<parser::ExprPtr> projections_;
@@ -54,6 +57,9 @@ private:
 
     // 推导表达式类型
     DataType deriveExpressionType(parser::ExprPtr expr);
+
+    // 判断表达式是否为聚合函数
+    bool isAggregateFunc(parser::ExprPtr expr);
 };
 
 } // namespace executor
