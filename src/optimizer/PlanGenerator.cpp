@@ -16,6 +16,9 @@
 #include "../executor/ExpressionEvaluator.h"
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <utility>
+#include <vector>
 
 using namespace minisql;
 using namespace optimizer;
@@ -39,6 +42,103 @@ std::string PlanGenerator::getAccessType(ScanType scanType, const std::string& i
     }
 }
 
+namespace {
+
+// 表在查询中的可用名称：有别名优先用别名
+std::string tableKeyOf(const parser::TableRef& ref) {
+    return ref.alias.empty() ? ref.name : ref.alias;
+}
+
+// 按"谓词引用的列属于哪张表"把 WHERE 拆开
+// 单表谓词下沉到该表的扫描之上；跨表/无法判定归属/含子查询的谓词保留在上层
+std::vector<parser::ExprPtr> splitPredicatesByTable(
+    const parser::ExprPtr& where,
+    const std::map<std::string, std::vector<std::string>>& tableNames,
+    std::map<std::string, std::vector<parser::ExprPtr>>& perTable) {
+
+    std::vector<parser::ExprPtr> residual;
+    if (!where || tableNames.empty()) {
+        if (where) residual.push_back(where);
+        return residual;
+    }
+
+    const bool singleTable = (tableNames.size() == 1);
+
+    for (const auto& conjunct : QueryRewriter::splitConjuncts(where)) {
+        std::vector<std::pair<std::string, std::string>> columns;
+        QueryRewriter::collectColumnRefs(conjunct, columns);
+
+        // 没有列引用的常量谓词、或含子查询的谓词不下推
+        if (columns.empty() || QueryRewriter::containsSubquery(conjunct)) {
+            residual.push_back(conjunct);
+            continue;
+        }
+
+        std::string targetKey;
+        bool pushable = true;
+
+        for (const auto& column : columns) {
+            std::string key;
+            if (column.first.empty()) {
+                // 未限定表名：只有单表查询才无歧义
+                if (!singleTable) {
+                    pushable = false;
+                    break;
+                }
+                key = tableNames.begin()->first;
+            } else {
+                // 用表名或别名匹配到同一张表
+                bool found = false;
+                for (const auto& entry : tableNames) {
+                    for (const auto& name : entry.second) {
+                        if (name == column.first) {
+                            key = entry.first;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+                if (!found) {
+                    pushable = false;
+                    break;
+                }
+            }
+
+            if (targetKey.empty()) {
+                targetKey = key;
+            } else if (targetKey != key) {
+                pushable = false;  // 跨表谓词，留给 JOIN 之后的 Filter
+                break;
+            }
+        }
+
+        if (pushable && !targetKey.empty()) {
+            perTable[targetKey].push_back(conjunct);
+        } else {
+            residual.push_back(conjunct);
+        }
+    }
+
+    return residual;
+}
+
+}  // namespace
+
+std::shared_ptr<PlanNode> PlanGenerator::makeFilterNode(
+    std::shared_ptr<PlanNode> child,
+    parser::ExprPtr condition) {
+
+    auto filterNode = std::make_shared<PlanNode>();
+    filterNode->nodeId = generateNodeId();
+    filterNode->operatorType = "Filter";
+    filterNode->condition = condition;
+    filterNode->children.push_back(child);
+    filterNode->estimatedRows = child->estimatedRows / 2;  // 简单估算
+    filterNode->cost = child->cost + filterNode->estimatedRows * CostModel::CPU_FILTER;
+    return filterNode;
+}
+
 Result<std::shared_ptr<PlanNode>> PlanGenerator::generate(
     const std::string& dbName,
     parser::SelectStmt* stmt) {
@@ -54,7 +154,47 @@ Result<std::shared_ptr<PlanNode>> PlanGenerator::generate(
     parser::SelectStmt* selectStmt = stmt;
 
     LOG_DEBUG("PlanGenerator", "Starting plan generation");
-    // 2. 生成扫描节点（传入 WHERE 条件以支持索引选择）
+
+    // ===== 谓词下推：按列归属把 WHERE 拆成单表谓词 =====
+    std::map<std::string, std::vector<std::string>> tableNames;  // 表键 -> {表名, 别名}
+    if (selectStmt->fromTable && !selectStmt->fromTable->subquery) {
+        const auto& ref = *selectStmt->fromTable;
+        auto& names = tableNames[tableKeyOf(ref)];
+        names.push_back(ref.name);
+        if (!ref.alias.empty()) {
+            names.push_back(ref.alias);
+        }
+    }
+    for (const auto& join : selectStmt->joins) {
+        if (!join->table || join->table->subquery) {
+            continue;
+        }
+        const auto& ref = *join->table;
+        auto& names = tableNames[tableKeyOf(ref)];
+        names.push_back(ref.name);
+        if (!ref.alias.empty()) {
+            names.push_back(ref.alias);
+        }
+    }
+
+    std::map<std::string, std::vector<parser::ExprPtr>> pushedPredicates;
+    std::vector<parser::ExprPtr> residualPredicates =
+        splitPredicatesByTable(selectStmt->whereClause, tableNames, pushedPredicates);
+
+    // 含外连接时，下推的谓词仍在外层保留一份：
+    // 否则会把"连接后再过滤"变成"先过滤再连接"，改变可空侧语义
+    bool hasOuterJoin = false;
+    for (const auto& join : selectStmt->joins) {
+        if (join->joinType != "INNER") {
+            hasOuterJoin = true;
+            break;
+        }
+    }
+    if (hasOuterJoin && selectStmt->whereClause) {
+        residualPredicates = QueryRewriter::splitConjuncts(selectStmt->whereClause);
+    }
+
+    // 2. 生成扫描节点（单表谓词同时用于索引选择）
     std::shared_ptr<PlanNode> current;
 
     if (selectStmt->fromTable && selectStmt->fromTable->subquery) {
@@ -75,22 +215,46 @@ Result<std::shared_ptr<PlanNode>> PlanGenerator::generate(
     } else {
         // 普通表扫描
         std::string tableName = selectStmt->fromTable ? selectStmt->fromTable->name : "";
-        auto scanResult = generateScanNode(dbName, tableName, selectStmt->whereClause);
+        std::string key = selectStmt->fromTable ? tableKeyOf(*selectStmt->fromTable) : "";
+
+        parser::ExprPtr scanPredicate;
+        auto pushedIt = pushedPredicates.find(key);
+        if (pushedIt != pushedPredicates.end()) {
+            scanPredicate = QueryRewriter::combineConjuncts(pushedIt->second);
+        }
+
+        auto scanResult = generateScanNode(dbName, tableName, scanPredicate);
         if (scanResult.isError()) {
             return Result<std::shared_ptr<PlanNode>>(scanResult.getError());
         }
         current = *scanResult.getValue();
+
+        // 谓词下沉到扫描之上：先过滤再参与后续连接
+        if (scanPredicate) {
+            current = makeFilterNode(current, scanPredicate);
+        }
     }
 
     // 2.3 处理 JOIN 节点（在 WHERE 之前串联）
     for (const auto& join : selectStmt->joins) {
         // 为右表生成扫描节点
         std::string rightTableName = join->table ? join->table->name : "";
-        auto rightScanResult = generateScanNode(dbName, rightTableName, nullptr);
+        std::string rightKey = join->table ? tableKeyOf(*join->table) : "";
+
+        parser::ExprPtr rightPredicate;
+        auto rightIt = pushedPredicates.find(rightKey);
+        if (rightIt != pushedPredicates.end()) {
+            rightPredicate = QueryRewriter::combineConjuncts(rightIt->second);
+        }
+
+        auto rightScanResult = generateScanNode(dbName, rightTableName, rightPredicate);
         if (rightScanResult.isError()) {
             return Result<std::shared_ptr<PlanNode>>(rightScanResult.getError());
         }
         auto rightScan = *rightScanResult.getValue();
+        if (rightPredicate) {
+            rightScan = makeFilterNode(rightScan, rightPredicate);
+        }
 
         // 生成 JOIN 节点
         auto joinNode = std::make_shared<PlanNode>();
@@ -104,18 +268,12 @@ Result<std::shared_ptr<PlanNode>> PlanGenerator::generate(
         current = joinNode;
     }
 
-    // 2.5 创建 Filter 节点处理 WHERE 条件
+    // 2.5 创建 Filter 节点处理剩余 WHERE 条件（跨表谓词、未下推的谓词）
     LOG_DEBUG("PlanGenerator", "Checking WHERE clause");
-    if (selectStmt->whereClause) {
+    parser::ExprPtr residualWhere = QueryRewriter::combineConjuncts(residualPredicates);
+    if (residualWhere) {
         LOG_DEBUG("PlanGenerator", "Creating Filter node");
-        auto filterNode = std::make_shared<PlanNode>();
-        filterNode->nodeId = generateNodeId();
-        filterNode->operatorType = "Filter";
-        filterNode->condition = selectStmt->whereClause;
-        filterNode->children.push_back(current);
-        filterNode->estimatedRows = current->estimatedRows / 2;  // 简单估算
-        filterNode->cost = current->cost + filterNode->estimatedRows * CostModel::CPU_FILTER;
-        current = filterNode;
+        current = makeFilterNode(current, residualWhere);
     }
 
     // 3. GROUP BY + 聚合

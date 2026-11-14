@@ -71,6 +71,11 @@ private:
         std::shared_ptr<PlanNode> child,
         int limit, int offset);
 
+    // 构造过滤节点（用于谓词下推后挂在扫描之上）
+    static std::shared_ptr<PlanNode> makeFilterNode(
+        std::shared_ptr<PlanNode> child,
+        parser::ExprPtr condition);
+
     // 物化扫描节点
     static Result<executor::OperatorPtr> materializeScanNode(
         const std::string& dbName,

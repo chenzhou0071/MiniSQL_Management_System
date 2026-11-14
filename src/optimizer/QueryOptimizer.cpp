@@ -31,12 +31,9 @@ Result<executor::OperatorPtr> QueryOptimizer::optimize(
 
     // ========== 步骤 1: 查询重写 ==========
     LOG_DEBUG("QueryOptimizer", "Step 1: Query rewriting");
-    // 暂时禁用查询重写来隔离问题
-    // auto rewrittenStmt = QueryRewriter::rewrite(stmt);
-    std::shared_ptr<parser::SelectStmt> rewrittenStmt = nullptr;
-    LOG_DEBUG("QueryOptimizer", "Query rewriting DISABLED");
+    auto rewrittenStmt = QueryRewriter::rewrite(stmt);
     if (!rewrittenStmt) {
-        LOG_WARN("QueryOptimizer", "Query rewriting disabled, using original statement");
+        LOG_WARN("QueryOptimizer", "Query rewriting failed, using original statement");
         rewrittenStmt = std::make_shared<parser::SelectStmt>(*stmt);
     }
 
@@ -60,25 +57,21 @@ Result<executor::OperatorPtr> QueryOptimizer::optimize(
 
     // ========== 步骤 4: 规则优化 ==========
     LOG_DEBUG("QueryOptimizer", "Step 4: Applying rule-based optimizations");
-    // 临时禁用
-    // auto ruleOptimizedPlan = RuleOptimizer::optimize(physicalPlan);
-    // if (!ruleOptimizedPlan.isSuccess()) {
-    //     LOG_WARN("QueryOptimizer", "Rule optimization failed, using unoptimized plan");
-    // } else {
-    //     physicalPlan = *ruleOptimizedPlan.getValue();
-    // }
-    LOG_DEBUG("QueryOptimizer", "Rule optimization DISABLED");
+    auto ruleOptimizedPlan = RuleOptimizer::optimize(physicalPlan);
+    if (!ruleOptimizedPlan.isSuccess()) {
+        LOG_WARN("QueryOptimizer", "Rule optimization failed, using unoptimized plan");
+    } else {
+        physicalPlan = *ruleOptimizedPlan.getValue();
+    }
 
     // ========== 步骤 5: 代价优化 ==========
     LOG_DEBUG("QueryOptimizer", "Step 5: Applying cost-based optimizations");
-    // 临时禁用
-    // auto costOptimizedPlan = CostOptimizer::optimize(dbName, physicalPlan);
-    // if (!costOptimizedPlan.isSuccess()) {
-    //     LOG_WARN("QueryOptimizer", "Cost optimization failed, using unoptimized plan");
-    // } else {
-    //     physicalPlan = *costOptimizedPlan.getValue();
-    // }
-    LOG_DEBUG("QueryOptimizer", "Cost optimization DISABLED");
+    auto costOptimizedPlan = CostOptimizer::optimize(dbName, physicalPlan);
+    if (!costOptimizedPlan.isSuccess()) {
+        LOG_WARN("QueryOptimizer", "Cost optimization failed, using unoptimized plan");
+    } else {
+        physicalPlan = *costOptimizedPlan.getValue();
+    }
 
     LOG_INFO("QueryOptimizer", "Query optimization completed");
     return Result<executor::OperatorPtr>(physicalPlan);
