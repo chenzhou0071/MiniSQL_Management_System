@@ -77,14 +77,100 @@ bool TransactionManager::rollback() {
 
     uint64_t txnId = txn->getId();
 
-    // 从后往前撤销操作
+    auto& tableMgr = storage::TableManager::getInstance();
+
+    // 从后往前撤销操作（后做的先撤销，保证依赖关系正确）
     for (auto it = txn->getOperations().rbegin();
          it != txn->getOperations().rend(); ++it) {
         const auto& op = *it;
         LOG_INFO("TransactionManager",
                  "Rolling back: " + std::to_string(static_cast<int>(op.type)) +
-                 " on " + op.table);
-        // TODO: 调用存储引擎执行撤销
+                 " on " + op.database + "." + op.table);
+
+        // 获取表定义（拿列类型用于解码行内容）
+        auto tableDefResult = tableMgr.getTableDef(op.database, op.table);
+        if (!tableDefResult.isSuccess()) {
+            LOG_WARN("TransactionManager",
+                     "Skip undo, table not found: " + op.database + "." + op.table);
+            continue;
+        }
+        TableDef tableDef = *tableDefResult.getValue();
+
+        std::vector<DataType> types;
+        types.reserve(tableDef.columns.size());
+        for (const auto& column : tableDef.columns) {
+            types.push_back(column.type);
+        }
+
+        // 加载表数据
+        auto tableDataResult = tableMgr.loadTable(op.database, op.table);
+        if (!tableDataResult.isSuccess()) {
+            LOG_WARN("TransactionManager",
+                     "Skip undo, cannot load table: " + op.database + "." + op.table);
+            continue;
+        }
+        storage::TableData tableData = *tableDataResult.getValue();
+
+        // 按行内容匹配，避免行号因删除重排而错位
+        auto findByContent = [&tableData](const Row& target, int& rowId) -> bool {
+            for (const auto& pair : tableData) {
+                if (pair.second == target) {
+                    rowId = pair.first;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        switch (op.type) {
+            case OpType::INSERT: {
+                // 撤销 INSERT：按新行内容找到该行并删除
+                Row newRow;
+                if (!WALManager::decodeRow(op.newValue, types, newRow)) {
+                    LOG_WARN("TransactionManager", "Undo INSERT: decode row failed");
+                    break;
+                }
+                int rowId = -1;
+                if (findByContent(newRow, rowId)) {
+                    tableMgr.deleteRow(op.database, op.table, rowId);
+                    LOG_INFO("TransactionManager",
+                             "Undo INSERT: deleted row " + std::to_string(rowId));
+                }
+                break;
+            }
+
+            case OpType::UPDATE: {
+                // 撤销 UPDATE：按新行内容找到该行，用旧行覆盖
+                Row oldRow, newRow;
+                if (!WALManager::decodeRow(op.oldValue, types, oldRow) ||
+                    !WALManager::decodeRow(op.newValue, types, newRow)) {
+                    LOG_WARN("TransactionManager", "Undo UPDATE: decode row failed");
+                    break;
+                }
+                int rowId = -1;
+                if (findByContent(newRow, rowId)) {
+                    tableMgr.updateRow(op.database, op.table, rowId, oldRow);
+                    LOG_INFO("TransactionManager",
+                             "Undo UPDATE: restored row " + std::to_string(rowId));
+                }
+                break;
+            }
+
+            case OpType::DELETE: {
+                // 撤销 DELETE：把被删行插回去
+                Row deletedRow;
+                if (!WALManager::decodeRow(op.oldValue, types, deletedRow)) {
+                    LOG_WARN("TransactionManager", "Undo DELETE: decode row failed");
+                    break;
+                }
+                tableMgr.insertRow(op.database, op.table, deletedRow);
+                LOG_INFO("TransactionManager", "Undo DELETE: restored row");
+                break;
+            }
+
+            default:
+                break;
+        }
     }
 
     txn->setState(Transaction::State::ABORTED);

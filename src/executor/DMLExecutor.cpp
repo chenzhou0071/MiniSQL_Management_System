@@ -16,6 +16,16 @@ uint64_t currentTxnId() {
     return txn ? txn->getId() : 0;
 }
 
+// 记录撤销日志（供 rollback 逆序撤销）
+void recordUndo(OpType type, const std::string& dbName, const std::string& table,
+                const std::string& key, const std::string& oldValue,
+                const std::string& newValue) {
+    auto* txn = TransactionManager::getCurrentTransaction();
+    if (txn) {
+        txn->recordOperation(type, dbName, table, key, oldValue, newValue);
+    }
+}
+
 }  // namespace
 
 std::string DMLExecutor::getCurrentDatabase() {
@@ -102,6 +112,9 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
         // 写WAL：记录插入行的内容，崩溃恢复时按内容去重重放
         wal.writeLog(txnId, LogType::INSERT, stmt->table, "",
                      WALManager::encodeRow(row), dbName);
+
+        // 记录撤销日志：回滚时按新行内容找到该行并删除
+        recordUndo(OpType::INSERT, dbName, stmt->table, "", "", WALManager::encodeRow(row));
 
         insertedCount++;
     }
@@ -210,6 +223,11 @@ Result<ExecutionResult> DMLExecutor::executeUpdate(const std::string& dbName, pa
             wal.writeLog(txnId, LogType::UPDATE, stmt->table,
                          WALManager::encodeRow(row), WALManager::encodeRow(updatedRow), dbName);
 
+            // 记录撤销日志：回滚时按新行内容找到该行，用旧行覆盖
+            recordUndo(OpType::UPDATE, dbName, stmt->table,
+                       WALManager::encodeRow(row), WALManager::encodeRow(row),
+                       WALManager::encodeRow(updatedRow));
+
             updatedCount++;
         }
     }
@@ -299,6 +317,10 @@ Result<ExecutionResult> DMLExecutor::executeDelete(const std::string& dbName, pa
         // 写WAL：记录被删除行的内容，恢复时按内容匹配
         wal.writeLog(txnId, LogType::DELETE, stmt->table,
                      WALManager::encodeRow(deletedRow), "", dbName);
+
+        // 记录撤销日志：回滚时把被删行插回去
+        recordUndo(OpType::DELETE, dbName, stmt->table,
+                   WALManager::encodeRow(deletedRow), WALManager::encodeRow(deletedRow), "");
 
         deletedCount++;
     }

@@ -12,10 +12,11 @@ enum class OpType { INSERT, UPDATE, DELETE };
 
 struct Operation {
     OpType type;
+    std::string database;
     std::string table;
-    std::string key;
-    std::string oldValue;
-    std::string newValue;
+    std::string key;       // INSERT: 空; UPDATE: 旧行内容; DELETE: 被删行内容
+    std::string oldValue;  // UPDATE: 旧行内容（冗余，便于直接用）
+    std::string newValue;  // INSERT: 新行内容; UPDATE: 新行内容; DELETE: 空
 };
 
 class Transaction {
@@ -27,7 +28,9 @@ public:
     uint64_t getId() const { return txnId_; }
     State getState() const { return state_; }
 
-    void recordOperation(OpType type, const std::string& table,
+    void recordOperation(OpType type,
+                        const std::string& database,
+                        const std::string& table,
                         const std::string& key,
                         const std::string& oldValue = "",
                         const std::string& newValue = "");
