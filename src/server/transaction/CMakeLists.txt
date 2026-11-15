@@ -5,3 +5,4 @@ target_sources(server_transaction PRIVATE
     WALManager.cpp
 )
 target_include_directories(server_transaction PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(server_transaction PUBLIC common storage)

@@ -14,8 +14,8 @@ class TransactionManager {
 public:
     static TransactionManager& getInstance();
 
-    // 获取当前线程的事务
-    Transaction* getCurrentTransaction();
+    // 获取当前线程的事务（读取 thread_local 状态，无实例依赖）
+    static Transaction* getCurrentTransaction();
 
     // 开始事务
     Transaction* begin();
