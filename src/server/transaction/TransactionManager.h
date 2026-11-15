@@ -32,11 +32,17 @@ public:
     // 崩溃恢复
     void recover();
 
+    // 检查点：写CHECKPOINT记录并截断日志（数据已直接落盘）
+    void checkpoint();
+
 private:
     TransactionManager() = default;
 
     void removeTransaction(uint64_t txnId);
     void addTransaction(uint64_t txnId, Transaction* txn);
+
+    // 重放单条日志
+    void replayEntry(const WALEntry& entry);
 
     thread_local static Transaction* currentTransaction_;
 

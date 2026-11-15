@@ -1,6 +1,8 @@
 // src/server/transaction/TransactionManager.cpp
 #include "TransactionManager.h"
 #include "../../common/Logger.h"
+#include "../../storage/TableManager.h"
+#include <set>
 
 namespace minisql {
 
@@ -49,9 +51,9 @@ bool TransactionManager::commit() {
 
     uint64_t txnId = txn->getId();
 
-    // 写COMMIT日志
+    // 写COMMIT日志并强制落盘：日志先于"提交成功"返回
     wal_.writeLog(txnId, LogType::COMMIT);
-    wal_.flush();
+    wal_.sync();
 
     txn->setState(Transaction::State::COMMITTED);
 
@@ -108,16 +110,160 @@ void TransactionManager::removeTransaction(uint64_t txnId) {
     activeTransactions_.erase(txnId);
 }
 
+// ============================================================
+// 崩溃恢复
+// 1. 从最后一个检查点开始扫描日志
+// 2. 收集已提交事务（出现COMMIT记录；txnId==0 视为自动提交）
+// 3. 按LSN顺序重放已提交事务的写操作（redo）
+// 4. 未提交事务直接跳过（相当于undo，当前数据层没有未提交脏页）
+// 5. 恢复完成后写检查点并截断日志
+// ============================================================
 void TransactionManager::recover() {
     auto entries = wal_.recover();
+    if (entries.empty()) {
+        LOG_INFO("TransactionManager", "Nothing to recover");
+        return;
+    }
 
-    // 简单恢复策略:重做所有已COMMIT的事务
-    // TODO: 实现完整的恢复逻辑
+    // 1. 定位最后一个检查点
+    size_t start = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i].type == LogType::CHECKPOINT) {
+            start = i + 1;
+        }
+    }
 
-    // 清空WAL
+    // 2. 收集已提交事务
+    std::set<uint64_t> committed;
+    for (size_t i = start; i < entries.size(); ++i) {
+        if (entries[i].type == LogType::COMMIT) {
+            committed.insert(entries[i].txnId);
+        }
+    }
+
+    // 3. 重放
+    int replayed = 0;
+    int skipped = 0;
+    for (size_t i = start; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        if (entry.type != LogType::INSERT &&
+            entry.type != LogType::UPDATE &&
+            entry.type != LogType::DELETE) {
+            continue;
+        }
+
+        // txnId == 0 表示自动提交（DML未显式开启事务）
+        bool isAutoCommit = (entry.txnId == 0);
+        bool isCommitted = committed.find(entry.txnId) != committed.end();
+
+        if (!isAutoCommit && !isCommitted) {
+            ++skipped;
+            continue;
+        }
+
+        replayEntry(entry);
+        ++replayed;
+    }
+
+    LOG_INFO("TransactionManager",
+             "Recovery finished: replayed " + std::to_string(replayed) +
+             " entries, skipped " + std::to_string(skipped) + " uncommitted");
+
+    // 4. 数据已落盘，写检查点并截断日志
+    checkpoint();
+}
+
+void TransactionManager::replayEntry(const WALEntry& entry) {
+    if (entry.database.empty() || entry.table.empty()) {
+        return;
+    }
+
+    auto& tableMgr = storage::TableManager::getInstance();
+
+    auto tableDefResult = tableMgr.getTableDef(entry.database, entry.table);
+    if (!tableDefResult.isSuccess()) {
+        LOG_WARN("TransactionManager",
+                 "Skip replay, table not found: " + entry.database + "." + entry.table);
+        return;
+    }
+    TableDef tableDef = *tableDefResult.getValue();
+
+    std::vector<DataType> types;
+    types.reserve(tableDef.columns.size());
+    for (const auto& column : tableDef.columns) {
+        types.push_back(column.type);
+    }
+
+    auto tableDataResult = tableMgr.loadTable(entry.database, entry.table);
+    if (!tableDataResult.isSuccess()) {
+        return;
+    }
+    storage::TableData tableData = *tableDataResult.getValue();
+
+    // 按行内容匹配，避免行号因删除重排而错位
+    auto findByContent = [&tableData](const Row& target, int& rowId) -> bool {
+        for (const auto& pair : tableData) {
+            if (pair.second == target) {
+                rowId = pair.first;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    switch (entry.type) {
+        case LogType::INSERT: {
+            Row newRow;
+            if (!WALManager::decodeRow(entry.value, types, newRow)) {
+                return;
+            }
+
+            int existingId = -1;
+            if (findByContent(newRow, existingId)) {
+                return;  // 已经存在，保证重放幂等
+            }
+
+            tableMgr.insertRow(entry.database, entry.table, newRow);
+            break;
+        }
+
+        case LogType::UPDATE: {
+            Row oldRow;
+            Row newRow;
+            if (!WALManager::decodeRow(entry.key, types, oldRow) ||
+                !WALManager::decodeRow(entry.value, types, newRow)) {
+                return;
+            }
+
+            int rowId = -1;
+            if (findByContent(oldRow, rowId)) {
+                tableMgr.updateRow(entry.database, entry.table, rowId, newRow);
+            }
+            break;
+        }
+
+        case LogType::DELETE: {
+            Row oldRow;
+            if (!WALManager::decodeRow(entry.key, types, oldRow)) {
+                return;
+            }
+
+            int rowId = -1;
+            if (findByContent(oldRow, rowId)) {
+                tableMgr.deleteRow(entry.database, entry.table, rowId);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void TransactionManager::checkpoint() {
+    wal_.writeCheckpoint();
     wal_.truncate();
-
-    LOG_INFO("TransactionManager", "Recovery completed");
+    LOG_INFO("TransactionManager", "Checkpoint completed, WAL truncated");
 }
 
 }  // namespace minisql

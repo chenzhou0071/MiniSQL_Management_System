@@ -1,10 +1,22 @@
 #include "DMLExecutor.h"
 #include "../storage/TableManager.h"
+#include "../server/transaction/TransactionManager.h"
+#include "../server/transaction/WALManager.h"
 #include "../common/Logger.h"
 #include <algorithm>
 
 namespace minisql {
 namespace executor {
+
+namespace {
+
+// 当前线程事务ID，0 表示自动提交
+uint64_t currentTxnId() {
+    auto* txn = TransactionManager::getCurrentTransaction();
+    return txn ? txn->getId() : 0;
+}
+
+}  // namespace
 
 std::string DMLExecutor::getCurrentDatabase() {
     // TODO: 实现当前数据库的跟踪
@@ -61,6 +73,8 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
 
     // 插入每一行
     int insertedCount = 0;
+    const uint64_t txnId = currentTxnId();
+    auto& wal = WALManager::getInstance();
     ExpressionEvaluator evaluator;
     evaluator.setCurrentDatabase(dbName);  // 设置数据库上下文
 
@@ -84,6 +98,10 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
         if (!insertResult.isSuccess()) {
             return Result<ExecutionResult>(insertResult.getError());
         }
+
+        // 写WAL：记录插入行的内容，崩溃恢复时按内容去重重放
+        wal.writeLog(txnId, LogType::INSERT, stmt->table, "",
+                     WALManager::encodeRow(row), dbName);
 
         insertedCount++;
     }
@@ -119,6 +137,8 @@ Result<ExecutionResult> DMLExecutor::executeUpdate(const std::string& dbName, pa
     storage::TableData tableData = *tableDataResult.getValue();
 
     int updatedCount = 0;
+    const uint64_t txnId = currentTxnId();
+    auto& wal = WALManager::getInstance();
     ExpressionEvaluator evaluator;
     evaluator.setCurrentDatabase(dbName);  // 设置数据库上下文
 
@@ -186,6 +206,10 @@ Result<ExecutionResult> DMLExecutor::executeUpdate(const std::string& dbName, pa
                 return Result<ExecutionResult>(updateResult.getError());
             }
 
+            // 写WAL：key 记录旧行内容，value 记录新行内容
+            wal.writeLog(txnId, LogType::UPDATE, stmt->table,
+                         WALManager::encodeRow(row), WALManager::encodeRow(updatedRow), dbName);
+
             updatedCount++;
         }
     }
@@ -222,6 +246,8 @@ Result<ExecutionResult> DMLExecutor::executeDelete(const std::string& dbName, pa
     storage::TableData tableData = *tableDataResult.getValue();
 
     int deletedCount = 0;
+    const uint64_t txnId = currentTxnId();
+    auto& wal = WALManager::getInstance();
     ExpressionEvaluator evaluator;
     evaluator.setCurrentDatabase(dbName);  // 设置数据库上下文
     std::vector<int> rowIdsToDelete;
@@ -258,10 +284,22 @@ Result<ExecutionResult> DMLExecutor::executeDelete(const std::string& dbName, pa
 
     // 删除行（从后往前，避免索引问题）
     for (auto it = rowIdsToDelete.rbegin(); it != rowIdsToDelete.rend(); ++it) {
+        auto rowIt = tableData.find(*it);
+        if (rowIt == tableData.end()) {
+            continue;
+        }
+
+        Row deletedRow = rowIt->second;
+
         auto deleteResult = tableMgr.deleteRow(dbName, stmt->table, *it);
         if (!deleteResult.isSuccess()) {
             return Result<ExecutionResult>(deleteResult.getError());
         }
+
+        // 写WAL：记录被删除行的内容，恢复时按内容匹配
+        wal.writeLog(txnId, LogType::DELETE, stmt->table,
+                     WALManager::encodeRow(deletedRow), "", dbName);
+
         deletedCount++;
     }
 
