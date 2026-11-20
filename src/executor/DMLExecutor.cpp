@@ -2,6 +2,7 @@
 #include "../storage/TableManager.h"
 #include "../server/transaction/TransactionManager.h"
 #include "../server/transaction/WALManager.h"
+#include "../server/concurrency/LockManager.h"
 #include "../common/Logger.h"
 #include <algorithm>
 
@@ -26,6 +27,31 @@ void recordUndo(OpType type, const std::string& dbName, const std::string& table
     }
 }
 
+// 表级写锁的 RAII 守卫：语句执行期间持有，析构自动释放
+// 锁的 key 用 "库名.表名"，避免不同库同名表互相干扰
+class TableWriteLockGuard {
+public:
+    explicit TableWriteLockGuard(const std::string& qualifiedTable)
+        : table_(qualifiedTable), held_(false) {
+        held_ = LockManager::getInstance().acquireTableLock(table_, LockType::WRITE);
+    }
+
+    ~TableWriteLockGuard() {
+        if (held_) {
+            LockManager::getInstance().releaseTableLock(table_);
+        }
+    }
+
+    TableWriteLockGuard(const TableWriteLockGuard&) = delete;
+    TableWriteLockGuard& operator=(const TableWriteLockGuard&) = delete;
+
+    bool acquired() const { return held_; }
+
+private:
+    std::string table_;
+    bool held_;
+};
+
 }  // namespace
 
 std::string DMLExecutor::getCurrentDatabase() {
@@ -44,6 +70,14 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
     if (!stmt) {
         MiniSQLException error(ErrorCode::EXEC_INVALID_VALUE, "NULL INSERT statement");
         return Result<ExecutionResult>(error);
+    }
+
+    // 表级写锁：同一张表的并发写互斥
+    TableWriteLockGuard tableLock(dbName + "." + stmt->table);
+    if (!tableLock.acquired()) {
+        return Result<ExecutionResult>(
+            MiniSQLException(ErrorCode::TRANSACTION_ERROR_BASE,
+                "Failed to acquire table lock: " + stmt->table + " (timeout)"));
     }
 
     auto& tableMgr = storage::TableManager::getInstance();
@@ -81,6 +115,38 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
         }
     }
 
+    // ---- 主键唯一性检查准备 ----
+    // 先算出主键列在「本次待插入行」和「表定义」中的下标。
+    // 若主键列没有显式出现在 INSERT 列表中（例如自增主键），本轮跳过检查。
+    std::vector<int> pkPositions;       // 主键在 row 中的下标
+    std::vector<int> pkColumnIndexes;   // 主键在 tableDef.columns 中的下标
+    bool pkCheckable = true;
+    for (size_t i = 0; i < tableDef.columns.size(); ++i) {
+        if (!tableDef.columns[i].primaryKey) continue;
+        auto it = std::find(columnNames.begin(), columnNames.end(), tableDef.columns[i].name);
+        if (it == columnNames.end()) {
+            pkCheckable = false;
+            break;
+        }
+        pkColumnIndexes.push_back(static_cast<int>(i));
+        pkPositions.push_back(static_cast<int>(it - columnNames.begin()));
+    }
+    bool needPkCheck = pkCheckable && !pkPositions.empty();
+
+    // 已有数据只加载一次（全表扫描；正式实现应走 B+Tree 索引，O(log N)）
+    storage::TableData existingData;
+    if (needPkCheck) {
+        auto dataResult = tableMgr.loadTable(dbName, stmt->table);
+        if (dataResult.isSuccess()) {
+            existingData = *dataResult.getValue();
+        } else {
+            needPkCheck = false;
+        }
+    }
+
+    // 同一条 INSERT 内部的重复主键
+    std::vector<std::vector<Value>> insertedKeys;
+
     // 插入每一行
     int insertedCount = 0;
     const uint64_t txnId = currentTxnId();
@@ -102,6 +168,42 @@ Result<ExecutionResult> DMLExecutor::executeInsert(const std::string& dbName, pa
             if (!fkResult.isSuccess()) {
                 return Result<ExecutionResult>(fkResult.getError());
             }
+        }
+
+        // 检查主键唯一性
+        if (needPkCheck && row.size() == columnNames.size()) {
+            std::vector<Value> key;
+            key.reserve(pkPositions.size());
+            for (int pos : pkPositions) {
+                key.push_back(row[pos]);
+            }
+
+            bool duplicate = false;
+            for (const auto& rowPair : existingData) {
+                const Row& existing = rowPair.second;
+                bool same = true;
+                for (size_t k = 0; k < key.size(); ++k) {
+                    if (existing.size() <= static_cast<size_t>(pkColumnIndexes[k]) ||
+                        !(existing[pkColumnIndexes[k]] == key[k])) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) { duplicate = true; break; }
+            }
+
+            if (!duplicate) {
+                for (const auto& inserted : insertedKeys) {
+                    if (inserted == key) { duplicate = true; break; }
+                }
+            }
+
+            if (duplicate) {
+                return Result<ExecutionResult>(
+                    MiniSQLException(ErrorCode::EXEC_DUPLICATE_ENTRY,
+                        "Duplicate entry for primary key on table: " + stmt->table));
+            }
+            insertedKeys.push_back(std::move(key));
         }
 
         auto insertResult = tableMgr.insertRow(dbName, stmt->table, row);
@@ -131,6 +233,14 @@ Result<ExecutionResult> DMLExecutor::executeUpdate(const std::string& dbName, pa
     if (!stmt) {
         MiniSQLException error(ErrorCode::EXEC_INVALID_VALUE, "NULL UPDATE statement");
         return Result<ExecutionResult>(error);
+    }
+
+    // 表级写锁：同一张表的并发写互斥
+    TableWriteLockGuard tableLock(dbName + "." + stmt->table);
+    if (!tableLock.acquired()) {
+        return Result<ExecutionResult>(
+            MiniSQLException(ErrorCode::TRANSACTION_ERROR_BASE,
+                "Failed to acquire table lock: " + stmt->table + " (timeout)"));
     }
 
     auto& tableMgr = storage::TableManager::getInstance();
@@ -245,6 +355,14 @@ Result<ExecutionResult> DMLExecutor::executeDelete(const std::string& dbName, pa
     if (!stmt) {
         MiniSQLException error(ErrorCode::EXEC_INVALID_VALUE, "NULL DELETE statement");
         return Result<ExecutionResult>(error);
+    }
+
+    // 表级写锁：同一张表的并发写互斥
+    TableWriteLockGuard tableLock(dbName + "." + stmt->table);
+    if (!tableLock.acquired()) {
+        return Result<ExecutionResult>(
+            MiniSQLException(ErrorCode::TRANSACTION_ERROR_BASE,
+                "Failed to acquire table lock: " + stmt->table + " (timeout)"));
     }
 
     auto& tableMgr = storage::TableManager::getInstance();

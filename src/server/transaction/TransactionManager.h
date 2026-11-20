@@ -17,6 +17,11 @@ public:
     // 获取当前线程的事务（读取 thread_local 状态，无实例依赖）
     static Transaction* getCurrentTransaction();
 
+    // 设置当前线程的事务上下文
+    // 用途：事务上下文实际属于「连接」而不是「线程」，
+    // 工作线程处理某条连接的请求前，先把该连接的事务恢复到 thread_local
+    static void setCurrentTransaction(Transaction* txn);
+
     // 开始事务
     Transaction* begin();
 

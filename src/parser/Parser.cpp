@@ -61,6 +61,8 @@ std::shared_ptr<ASTNode> Parser::parseStatement() {
     if (checkKeyword("DESC") || checkKeyword("DESCRIBE")) return parseDescribeStatement();
     if (checkKeyword("EXPLAIN")) return parseExplainStatement();
     if (checkKeyword("ANALYZE")) return parseAnalyzeStatement();
+    if (checkKeyword("BEGIN") || checkKeyword("COMMIT") || checkKeyword("ROLLBACK"))
+        return parseTransactionStatement();
     if (checkKeyword("SELECT")) return parseSelectStatement();
     if (checkKeyword("INSERT")) return parseInsertStatement();
     if (checkKeyword("UPDATE")) return parseUpdateStatement();
@@ -73,6 +75,25 @@ std::shared_ptr<ASTNode> Parser::parseStatement() {
         ErrorCode::PARSER_SYNTAX_ERROR,
         "Unknown statement: " + current_.value
     );
+}
+
+std::shared_ptr<ASTNode> Parser::parseTransactionStatement() {
+    if (checkKeyword("BEGIN")) {
+        advance();
+        match(TokenType::SEMICOLON);  // 可选的分号
+        return std::make_shared<TransactionStmt>(TransactionStmt::Kind::BEGIN);
+    }
+
+    if (checkKeyword("COMMIT")) {
+        advance();
+        match(TokenType::SEMICOLON);
+        return std::make_shared<TransactionStmt>(TransactionStmt::Kind::COMMIT);
+    }
+
+    // ROLLBACK
+    advance();
+    match(TokenType::SEMICOLON);
+    return std::make_shared<TransactionStmt>(TransactionStmt::Kind::ROLLBACK);
 }
 
 std::shared_ptr<ASTNode> Parser::parseUseStatement() {

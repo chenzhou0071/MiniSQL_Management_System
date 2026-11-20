@@ -102,6 +102,11 @@ int Reactor::createListenSocket(int port) {
         return -1;
     }
 
+    // 设置监听socket为非阻塞：多个Reactor线程共享同一个listenFd，
+    // 惊群时只有一个accept成功，其余必须立即返回，否则会阻塞事件循环
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
     LOG_INFO("Reactor", "Listening on port " + std::to_string(port));
 
     return fd;  // 返回监听socket
@@ -157,6 +162,25 @@ void Reactor::stop() {
 void Reactor::removeFromEpoll(int fd) {
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
+
+    // 清理该连接的接收缓冲区
+    {
+        std::lock_guard<std::mutex> lock(recvBuffersMutex_);
+        recvBuffers_.erase(fd);
+    }
+
+    // 通知上层清理会话（fd 会被内核复用，不清理会导致会话串线）
+    if (closeHandler_) {
+        closeHandler_(fd);
+    }
+}
+
+// 重新挂载 EPOLLONESHOT，等待该连接的下一次读事件
+void Reactor::rearmRead(int fd) {
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLONESHOT;
+    ev.data.fd = fd;
+    epoll_ctl(epollFd_, EPOLL_CTL_MOD, fd, &ev);
 }
 
 // ============================================================
@@ -258,43 +282,78 @@ void Reactor::handleNewConnection() {
 // - 分离I/O和计算，充分利用多核CPU
 // ============================================================
 void Reactor::handleRead(int fd) {
-    char buf[4096];  // 读取缓冲区
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);  // 读取数据
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf));
 
-    if (n <= 0) {
-        // 连接关闭或读取错误，移除并关闭socket
+    if (n == 0) {
+        // 对端正常关闭
+        removeFromEpoll(fd);
+        return;
+    }
+    if (n < 0) {
+        // EAGAIN/EWOULDBLOCK：本次没有更多数据，等下次事件
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            rearmRead(fd);
+        } else {
+            removeFromEpoll(fd);
+        }
+        return;
+    }
+
+    // 每个连接一条语句为一行：把新数据追加到该连接的应用层缓冲区，
+    // 再按 '\n' 切出所有完整语句（解决粘包），不完整的半包留到下次
+    const size_t kMaxPendingBytes = 1024 * 1024;  // 单连接缓冲区上限，防止恶意无换行数据打爆内存
+    std::vector<std::string> statements;
+    bool overflow = false;
+
+    {
+        std::lock_guard<std::mutex> lock(recvBuffersMutex_);
+        std::string& pending = recvBuffers_[fd];
+        pending.append(buf, static_cast<size_t>(n));
+
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, pos);
+            pending.erase(0, pos + 1);
+
+            // 去掉行尾 '\r' 与首尾空白
+            size_t first = line.find_first_not_of(" \t\r");
+            if (first == std::string::npos) {
+                continue;  // 空行
+            }
+            size_t last = line.find_last_not_of(" \t\r");
+            statements.push_back(line.substr(first, last - first + 1));
+        }
+
+        if (pending.size() > kMaxPendingBytes) {
+            overflow = true;
+            pending.clear();
+        }
+    }
+
+    if (overflow) {
+        LOG_WARN("Reactor", "Receive buffer overflow, closing connection");
         removeFromEpoll(fd);
         return;
     }
 
-    buf[n] = '\0';  // 添加字符串结束符
-    std::string sql(buf);  // 转换为字符串
-
-    // 去除换行符和空白字符
-    size_t end = sql.find_last_not_of(" \t\r\n");
-    if (end == std::string::npos) {
-        sql.clear();
-    } else {
-        sql = sql.substr(0, end + 1);
-    }
-
-    // 如果SQL为空或没有处理器，关闭连接
-    if (sql.empty() || !sqlHandler_) {
+    if (!sqlHandler_) {
         removeFromEpoll(fd);
         return;
     }
 
-    // 提交SQL到线程池处理（异步执行）
-    int clientFd = fd;  // 保存文件描述符
-    threadPool_->submit([this, clientFd, sql]() {
-        // ThreadPool线程执行：处理SQL并返回结果
-        sqlHandler_(clientFd, sql);
+    if (statements.empty()) {
+        // 半包：还没凑齐一条完整语句，重新挂载等待后续数据
+        rearmRead(fd);
+        return;
+    }
 
-        // 处理完成后，重新启用EPOLLONESHOT，等待下一个请求
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLONESHOT;  // 重新注册可读事件
-        ev.data.fd = clientFd;
-        epoll_ctl(epollFd_, EPOLL_CTL_MOD, clientFd, &ev);  // EPOLL_CTL_MOD重新启用
+    // 提交到线程池：同一连接的语句串行执行，全部处理完再重新挂载 EPOLLONESHOT
+    threadPool_->submit([this, fd, statements]() {
+        for (const auto& sql : statements) {
+            sqlHandler_(fd, sql);
+        }
+        rearmRead(fd);
     });
 }
 

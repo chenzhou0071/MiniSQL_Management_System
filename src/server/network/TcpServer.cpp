@@ -29,68 +29,57 @@ TcpServer::TcpServer(int port, int threadCount)
     : port_(port), threadCount_(threadCount) {
     reactor_ = std::make_unique<Reactor>(port, threadCount);
 
+    // 连接关闭时清理会话（fd 会被内核复用，不清理会导致会话串线）
+    reactor_->setCloseHandler([this](int fd) {
+        removeSession(fd);
+    });
+
     // 设置SQL处理函数
     reactor_->setSqlHandler([this](int fd, const std::string& sql) {
-        LOG_INFO("TcpServer", "=== SQL Handler Start ===");
         LOG_INFO("TcpServer", "Received SQL: [" + sql + "]");
-        LOG_INFO("TcpServer", "SQL length: " + std::to_string(sql.length()));
 
-        // 获取当前连接的会话
-        auto& session = getOrCreateSession(fd);
-        std::string currentDb = session.getCurrentDatabase();
+        // 取当前连接的会话状态（内部加锁，返回值拷贝）
+        std::string currentDb = getSessionDatabase(fd);
+
+        // 事务上下文属于连接而非线程：先把该连接的事务恢复到当前工作线程
+        TransactionManager::setCurrentTransaction(getSessionTransaction(fd));
 
         SqlResponse response;
 
         try {
-            LOG_INFO("TcpServer", "Step 1: Creating Lexer...");
             // 解析 SQL
             parser::Lexer lexer(sql);
-            LOG_INFO("TcpServer", "Step 2: Lexer created, creating Parser...");
-
             parser::Parser parser(lexer);
-            LOG_INFO("TcpServer", "Step 3: Parser created, parsing statement...");
-
             auto stmt = parser.parseStatement();
-            LOG_INFO("TcpServer", "Step 4: Statement parsed, type: " + std::to_string(static_cast<int>(stmt->getType())));
 
             // 执行 SQL（使用会话的数据库）
-            LOG_INFO("TcpServer", "Step 5: Getting Executor instance...");
             auto& executor = executor::Executor::getInstance();
-            LOG_INFO("TcpServer", "Step 6: Executor instance obtained, executing statement...");
-            LOG_INFO("TcpServer", "Step 6b: Using database from session: [" + currentDb + "]");
-
             auto execResult = executor.execute(stmt.get(), currentDb);
-            LOG_INFO("TcpServer", "Step 7: Statement executed, checking result...");
 
             // 如果是 USE 语句，更新会话的数据库
             if (execResult.isSuccess() && stmt->getType() == parser::ASTNodeType::USE_STMT) {
                 auto useStmt = dynamic_cast<parser::UseStmt*>(stmt.get());
                 if (useStmt) {
-                    session.setCurrentDatabase(useStmt->database);
+                    setSessionDatabase(fd, useStmt->database);
+                    currentDb = useStmt->database;
                     LOG_INFO("TcpServer", "Session database updated to: " + useStmt->database);
                 }
             }
 
             if (!execResult.isSuccess()) {
-                LOG_INFO("TcpServer", "Step 8a: Execution failed");
                 response.success = false;
                 response.message = execResult.getError().what();
-                LOG_INFO("TcpServer", "Error message: " + response.message);
             } else {
-                LOG_INFO("TcpServer", "Step 8b: Execution succeeded");
                 response.success = true;
                 response.message = "Query OK";
 
                 // 获取列名和数据
-                LOG_INFO("TcpServer", "Step 9: Getting result...");
                 auto* result = execResult.getValue();
                 if (result) {
-                    LOG_INFO("TcpServer", "Step 10: Result obtained, row count: " + std::to_string(result->getRowCount()));
                     response.rowCount = result->getRowCount();
                     response.columns = result->columnNames;
 
                     // 转换 Tuple -> vector<string>
-                    LOG_INFO("TcpServer", "Step 11: Converting rows...");
                     for (auto& row : result->rows) {
                         std::vector<std::string> rowStr;
                         for (auto& val : row) {
@@ -98,9 +87,6 @@ TcpServer::TcpServer(int port, int threadCount)
                         }
                         response.rows.push_back(std::move(rowStr));
                     }
-                    LOG_INFO("TcpServer", "Step 12: Rows converted, count: " + std::to_string(response.rows.size()));
-                } else {
-                    LOG_INFO("TcpServer", "Step 10: No result data");
                 }
             }
 
@@ -118,25 +104,17 @@ TcpServer::TcpServer(int port, int threadCount)
             response.message = "Unknown error occurred";
         }
 
-        LOG_INFO("TcpServer", "Step 13: Building response...");
-        LOG_INFO("TcpServer", "  Columns count: " + std::to_string(response.columns.size()));
-        LOG_INFO("TcpServer", "  Rows count: " + std::to_string(response.rows.size()));
-        for (size_t i = 0; i < response.columns.size(); ++i) {
-            LOG_INFO("TcpServer", "  Column[" + std::to_string(i) + "]: " + response.columns[i]);
-        }
+        // 保存事务上下文：BEGIN 后会变成新事务指针，
+        // COMMIT/ROLLBACK 后变成 nullptr，下次请求进来再恢复
+        setSessionTransaction(fd, TransactionManager::getCurrentTransaction());
+
         std::string resp = SqlProtocol::buildResponse(response);
-        LOG_INFO("TcpServer", "Step 14: Response built, size: " + std::to_string(resp.size()));
-        LOG_INFO("TcpServer", "Step 15: Sending response...");
 
         // 直接发送响应
         ssize_t sent = ::send(fd, resp.c_str(), resp.size(), 0);
         if (sent < 0) {
             LOG_ERROR("TcpServer", "send() failed: " + std::string(strerror(errno)));
-        } else {
-            LOG_INFO("TcpServer", "Response sent, bytes: " + std::to_string(sent));
         }
-
-        LOG_INFO("TcpServer", "=== SQL Handler End ===");
     });
 }
 
@@ -173,14 +151,45 @@ void TcpServer::stop() {
     LOG_INFO("TcpServer", "Server stopped");
 }
 
-server::Session& TcpServer::getOrCreateSession(int fd) {
+std::string TcpServer::getSessionDatabase(int fd) {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
-    return sessions_[fd];  // 自动创建或返回已有Session
+    return sessions_[fd].getCurrentDatabase();
+}
+
+void TcpServer::setSessionDatabase(int fd, const std::string& db) {
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    sessions_[fd].setCurrentDatabase(db);
+}
+
+Transaction* TcpServer::getSessionTransaction(int fd) {
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    return sessions_[fd].getTransaction();
+}
+
+void TcpServer::setSessionTransaction(int fd, Transaction* txn) {
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    sessions_[fd].setTransaction(txn);
 }
 
 void TcpServer::removeSession(int fd) {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    sessions_.erase(fd);
+    Transaction* txn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        auto it = sessions_.find(fd);
+        if (it == sessions_.end()) {
+            return;
+        }
+        txn = it->second.getTransaction();
+        sessions_.erase(it);
+    }
+
+    // 连接断开时还有未提交事务，必须回滚，避免留下部分写入
+    if (txn) {
+        LOG_INFO("TcpServer", "Connection closed with active transaction, rolling back");
+        TransactionManager::setCurrentTransaction(txn);
+        TransactionManager::getInstance().rollback();
+        TransactionManager::setCurrentTransaction(nullptr);
+    }
 }
 
 }  // namespace minisql

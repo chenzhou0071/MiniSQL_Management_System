@@ -42,6 +42,10 @@ Transaction* TransactionManager::getCurrentTransaction() {
     return currentTransaction_;
 }
 
+void TransactionManager::setCurrentTransaction(Transaction* txn) {
+    currentTransaction_ = txn;
+}
+
 bool TransactionManager::commit() {
     auto* txn = currentTransaction_;
     if (!txn) {

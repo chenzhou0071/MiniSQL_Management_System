@@ -32,6 +32,7 @@ private:
     std::shared_ptr<ASTNode> parseDescribeStatement();
     std::shared_ptr<ASTNode> parseExplainStatement();
     std::shared_ptr<ASTNode> parseAnalyzeStatement();
+    std::shared_ptr<ASTNode> parseTransactionStatement();
     std::shared_ptr<SelectStmt> parseSelectStatement();
     std::shared_ptr<InsertStmt> parseInsertStatement();
     std::shared_ptr<UpdateStmt> parseUpdateStatement();

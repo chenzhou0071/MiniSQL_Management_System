@@ -52,14 +52,19 @@ public:
 
     size_t getQueueSize() const;
 
+    // 设置任务队列上限（有界队列，对生产者形成背压）
+    void setMaxQueueSize(size_t maxSize) { maxQueueSize_ = maxSize; }
+
 private:
     void workerThread();  // 工作线程函数
 
     std::vector<std::thread> workers_;              // 工作线程列表
     std::queue<std::function<void()>> tasks_;        // 任务队列
     std::mutex queueMutex_;                          // 队列互斥锁
-    std::condition_variable condition_;              // 条件变量（同步）
+    std::condition_variable condition_;              // 条件变量（队列非空通知）
+    std::condition_variable notFull_;                // 条件变量（队列不满通知）
     std::atomic<bool> stop_{false};                  // 停止标志
+    size_t maxQueueSize_ = 4096;                     // 队列上限，防止任务无限堆积打爆内存
 };
 
 // ============================================================
@@ -87,7 +92,13 @@ auto ThreadPool::submit(F&& f) -> std::future<decltype(f())> {
     auto task = std::make_shared<std::packaged_task<return_type()>>(std::forward<F>(f));
 
     {
-        std::lock_guard<std::mutex> lock(queueMutex_);  // 加锁保护队列
+        std::unique_lock<std::mutex> lock(queueMutex_);  // 加锁保护队列
+
+        // 有界队列：满了就阻塞生产者（背压），避免任务无限堆积
+        notFull_.wait(lock, [this] {
+            return stop_.load() || tasks_.size() < maxQueueSize_;
+        });
+
         tasks_.emplace([task]() { (*task)(); });        // 加入队列（lambda包装）
     }
 

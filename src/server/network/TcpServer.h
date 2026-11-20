@@ -11,6 +11,7 @@
 namespace minisql {
 
 class Reactor;
+class Transaction;
 
 class TcpServer {
 public:
@@ -23,8 +24,11 @@ public:
     void setDataDir(const std::string& dir) { dataDir_ = dir; }
 
 private:
-    // 会话管理
-    server::Session& getOrCreateSession(int fd);
+    // 会话管理（内部加锁，避免把容器元素的引用暴露到锁外）
+    std::string getSessionDatabase(int fd);
+    void setSessionDatabase(int fd, const std::string& db);
+    Transaction* getSessionTransaction(int fd);
+    void setSessionTransaction(int fd, Transaction* txn);
     void removeSession(int fd);
 
     int port_;

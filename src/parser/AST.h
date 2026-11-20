@@ -33,6 +33,9 @@ enum class ASTNodeType {
     DESCRIBE_STMT,
     EXPLAIN_STMT,
     ANALYZE_STMT,
+    BEGIN_STMT,
+    COMMIT_STMT,
+    ROLLBACK_STMT,
 
     // 表达式节点
     EXPRESSION,
@@ -616,6 +619,34 @@ public:
     std::string toString() const override {
         return "ANALYZE TABLE " + tableName;
     }
+};
+
+// ============================================================
+// 事务控制语句（BEGIN / COMMIT / ROLLBACK）
+// ============================================================
+class TransactionStmt : public ASTNode {
+public:
+    enum class Kind { BEGIN, COMMIT, ROLLBACK };
+
+    explicit TransactionStmt(Kind kind)
+        : ASTNode(kind == Kind::BEGIN ? ASTNodeType::BEGIN_STMT
+                 : kind == Kind::COMMIT ? ASTNodeType::COMMIT_STMT
+                 : ASTNodeType::ROLLBACK_STMT),
+          kind_(kind) {}
+
+    Kind getKind() const { return kind_; }
+
+    std::string toString() const override {
+        switch (kind_) {
+            case Kind::BEGIN:    return "BEGIN";
+            case Kind::COMMIT:   return "COMMIT";
+            case Kind::ROLLBACK: return "ROLLBACK";
+        }
+        return "BEGIN";
+    }
+
+private:
+    Kind kind_;
 };
 
 }  // namespace parser

@@ -117,6 +117,11 @@ void Keywords::initKeywords() {
     keywords_["EXPLAIN"] = TokenType::KEYWORD;
     keywords_["ANALYZE"] = TokenType::KEYWORD;
 
+    // 事务控制
+    keywords_["BEGIN"] = TokenType::KEYWORD;
+    keywords_["COMMIT"] = TokenType::KEYWORD;
+    keywords_["ROLLBACK"] = TokenType::KEYWORD;
+
     initialized_ = true;
 }
 

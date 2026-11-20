@@ -43,6 +43,7 @@ endif()
 add_subdirectory(src/common)
 add_subdirectory(src/storage)
 add_subdirectory(src/parser)
+add_subdirectory(src/server/concurrency)   # executor 依赖表级锁
 add_subdirectory(src/server/transaction)   # executor 依赖事务/WAL
 add_subdirectory(src/executor)
 add_subdirectory(src/optimizer)

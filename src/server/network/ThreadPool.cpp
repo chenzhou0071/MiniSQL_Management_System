@@ -18,6 +18,7 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::stop() {
     stop_.store(true);
     condition_.notify_all();
+    notFull_.notify_all();   // 唤醒被背压阻塞的生产者
     for (auto& worker : workers_) {
         if (worker.joinable()) {
             worker.join();
@@ -40,6 +41,7 @@ void ThreadPool::workerThread() {
 
             task = std::move(tasks_.front());
             tasks_.pop();
+            notFull_.notify_one();   // 腾出位置，唤醒等待的生产者
         }
         task();
     }

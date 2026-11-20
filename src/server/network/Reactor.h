@@ -8,6 +8,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace minisql {
 
@@ -33,11 +35,17 @@ public:
         sqlHandler_ = handler;
     }
 
+    // 设置连接关闭回调（用于清理会话、回滚未提交事务）
+    void setCloseHandler(std::function<void(int fd)> handler) {
+        closeHandler_ = handler;
+    }
+
 private:
     void eventLoop();
     int createEpoll();
     int createListenSocket(int port);
     void removeFromEpoll(int fd);
+    void rearmRead(int fd);
 
     int epollFd_;
     int listenFd_;
@@ -47,6 +55,11 @@ private:
     std::atomic<bool> running_{false};
 
     std::function<void(int fd, const std::string& sql)> sqlHandler_;
+    std::function<void(int fd)> closeHandler_;
+
+    // 每个连接的应用层接收缓冲区：解决 TCP 粘包/半包
+    std::unordered_map<int, std::string> recvBuffers_;
+    std::mutex recvBuffersMutex_;
 };
 
 }  // namespace minisql

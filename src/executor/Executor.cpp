@@ -9,6 +9,7 @@
 #include "SortOperator.h"
 #include "DMLExecutor.h"
 #include "DDLExecutor.h"
+#include "../server/transaction/TransactionManager.h"
 #include "../optimizer/QueryOptimizer.h"
 #include "../optimizer/ExplainHandler.h"
 #include "../optimizer/PlanGenerator.h"
@@ -56,6 +57,51 @@ static void extractAggregates(const std::vector<parser::ExprPtr>& selectItems,
 Executor& Executor::getInstance() {
     static Executor instance;
     return instance;
+}
+
+// 事务控制语句：BEGIN / COMMIT / ROLLBACK
+// 事务上下文由 TransactionManager 的 thread_local 维护，
+// 上层（TcpServer）负责在请求进入/结束时把它和会话绑定
+static Result<ExecutionResult> executeTransactionStatement(parser::TransactionStmt::Kind kind) {
+    auto& txnMgr = TransactionManager::getInstance();
+
+    switch (kind) {
+        case parser::TransactionStmt::Kind::BEGIN: {
+            if (TransactionManager::getCurrentTransaction() != nullptr) {
+                return Result<ExecutionResult>(
+                    MiniSQLException(ErrorCode::TRANSACTION_ALREADY_ACTIVE,
+                        "Transaction already active on this session"));
+            }
+            if (!txnMgr.begin()) {
+                return Result<ExecutionResult>(
+                    MiniSQLException(ErrorCode::TRANSACTION_ERROR_BASE,
+                        "Failed to start transaction"));
+            }
+            break;
+        }
+
+        case parser::TransactionStmt::Kind::COMMIT:
+            if (!txnMgr.commit()) {
+                return Result<ExecutionResult>(
+                    MiniSQLException(ErrorCode::TRANSACTION_NOT_ACTIVE,
+                        "No active transaction to commit"));
+            }
+            break;
+
+        case parser::TransactionStmt::Kind::ROLLBACK:
+            if (!txnMgr.rollback()) {
+                return Result<ExecutionResult>(
+                    MiniSQLException(ErrorCode::TRANSACTION_NOT_ACTIVE,
+                        "No active transaction to rollback"));
+            }
+            break;
+    }
+
+    ExecutionResult result;
+    result.columnNames = {"status"};
+    result.columnTypes = {DataType::VARCHAR};
+    result.rows.push_back({Value("OK")});
+    return Result<ExecutionResult>(result);
 }
 
 Result<ExecutionResult> Executor::execute(parser::ASTNode* stmt) {
@@ -142,6 +188,18 @@ Result<ExecutionResult> Executor::execute(parser::ASTNode* stmt) {
                     Value("OK")
                 });
                 return Result<ExecutionResult>(result);
+            }
+
+            case parser::ASTNodeType::BEGIN_STMT:
+            case parser::ASTNodeType::COMMIT_STMT:
+            case parser::ASTNodeType::ROLLBACK_STMT: {
+                auto txnStmt = dynamic_cast<parser::TransactionStmt*>(stmt);
+                if (!txnStmt) {
+                    return Result<ExecutionResult>(
+                        MiniSQLException(ErrorCode::EXEC_INVALID_VALUE,
+                            "Invalid transaction statement"));
+                }
+                return executeTransactionStatement(txnStmt->getKind());
             }
 
             case parser::ASTNodeType::CREATE_DATABASE_STMT: {
@@ -288,6 +346,18 @@ Result<ExecutionResult> Executor::execute(parser::ASTNode* stmt, const std::stri
                     Value("OK")
                 });
                 return Result<ExecutionResult>(result);
+            }
+
+            case parser::ASTNodeType::BEGIN_STMT:
+            case parser::ASTNodeType::COMMIT_STMT:
+            case parser::ASTNodeType::ROLLBACK_STMT: {
+                auto txnStmt = dynamic_cast<parser::TransactionStmt*>(stmt);
+                if (!txnStmt) {
+                    return Result<ExecutionResult>(
+                        MiniSQLException(ErrorCode::EXEC_INVALID_VALUE,
+                            "Invalid transaction statement"));
+                }
+                return executeTransactionStatement(txnStmt->getKind());
             }
 
             case parser::ASTNodeType::CREATE_DATABASE_STMT: {

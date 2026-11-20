@@ -23,12 +23,11 @@ TcpClient::~TcpClient() {
 bool TcpClient::connectToHost(const QString &host, quint16 port) {
     host_ = host;
     port_ = port;
+    buffer_.clear();
 
+    // 异步连接：立即返回，不阻塞 UI 线程。
+    // 连接成功由 connected 信号通知，失败由 errorOccurred 信号通知。
     socket_->connectToHost(host, port);
-    if (!socket_->waitForConnected(5000)) {
-        emit errorOccurred(socket_->errorString());
-        return false;
-    }
     return true;
 }
 

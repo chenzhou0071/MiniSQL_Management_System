@@ -117,10 +117,8 @@ void MainWindow::onConnectClicked() {
         hostEdit_->setEnabled(false);
         portSpinBox_->setEnabled(false);
 
-        if (!client_->connectToHost(host, port)) {
-            // 连接失败 - waitForConnected已经在TcpClient里emit了error
-            // 这里按钮会在onError里恢复
-        }
+        // 异步连接：立即返回，结果由 connected / errorOccurred 信号驱动
+        client_->connectToHost(host, port);
     }
 }
 
